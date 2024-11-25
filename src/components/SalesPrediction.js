@@ -1,46 +1,29 @@
 import React, { useState } from 'react';
 import * as tf from '@tensorflow/tfjs';
-import { Box, Button, CircularProgress, Typography } from '@mui/material';
+import { Box, Button, CircularProgress, Typography, Select, MenuItem, InputLabel, FormControl } from '@mui/material';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
 import { preprocessData, createDataset, denormalizeQuantity, generateFutureDates } from '../utils/dataPreprocessing';
 
 const SalesPrediction = ({ data }) => {
     const [isTraining, setIsTraining] = useState(false);
     const [predictions, setPredictions] = useState(null);
+    const [selectedProduct, setSelectedProduct] = useState('');
     const [error, setError] = useState('');
     const [trainingProgress, setTrainingProgress] = useState({ epoch: 0, loss: 0, totalEpochs: 100 });
 
     const createModel = () => {
         const model = tf.sequential();
-        
-        model.add(tf.layers.lstm({
-            units: 32,
-            inputShape: [6, 2],
-            returnSequences: false
-        }));
-        
-        model.add(tf.layers.dense({
-            units: 16,
-            activation: 'relu'
-        }));
-        
-        model.add(tf.layers.dense({
-            units: 1,
-            activation: 'sigmoid'
-        }));
-
-        model.compile({
-            optimizer: tf.train.adam(0.001),
-            loss: 'meanSquaredError'
-        });
-
+        model.add(tf.layers.lstm({ units: 32, inputShape: [6, 2], returnSequences: false }));
+        model.add(tf.layers.dense({ units: 16, activation: 'relu' }));
+        model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
+        model.compile({ optimizer: tf.train.adam(0.001), loss: 'meanSquaredError' });
         return model;
     };
 
     const trainModel = async () => {
         setIsTraining(true);
         setError('');
-        
+
         try {
             const processedData = preprocessData(data);
             const dataset = createDataset(
@@ -58,61 +41,62 @@ const SalesPrediction = ({ data }) => {
                 shuffle: true,
                 callbacks: {
                     onEpochEnd: (epoch, logs) => {
-                        setTrainingProgress(prev => ({
-                            ...prev,
+                        setTrainingProgress({
                             epoch: epoch + 1,
-                            loss: logs.loss.toFixed(4)
-                        }));
-                        console.log(`Epoch ${epoch + 1}/100, Loss: ${logs.loss.toFixed(4)}`);
-                    }
-                }
+                            loss: logs.loss.toFixed(4),
+                            totalEpochs: 100,
+                        });
+                    },
+                },
             });
 
-            // Generate predictions for next 6 months
-            const lastDate = Math.max(...processedData.dates);
-            const futureDates = Array.from({ length: 6 }, (_, i) => lastDate + i + 1);
-            
-            const predictions = [];
             const uniqueProducts = Object.keys(processedData.productEncoder);
-
-            console.log('Generating predictions for products:', uniqueProducts);
-
-            for (const product of uniqueProducts) {
+            const predictions = uniqueProducts.map((product) => {
                 const productId = processedData.productEncoder[product];
-                const inputSequence = futureDates.map(date => [date, productId]);
-                
-                // Create input tensor with correct shape [1, 6, 2]
-                const inputTensor = tf.tensor3d([inputSequence], [1, 6, 2]);
-                const prediction = model.predict(inputTensor);
-                const predictionValues = Array.from(prediction.dataSync());
-                
-                console.log(`Predictions for ${product}:`, predictionValues);
-                
-                const denormalizedPredictions = predictionValues.map(value => 
-                    denormalizeQuantity(value, processedData.minQuantity, processedData.maxQuantity)
-                );
+                const last6Months = processedData.dates.slice(-6);
+                const lastQuantities = processedData.quantities
+                    .filter((_, index) => processedData.products[index] === productId)
+                    .slice(-6);
 
-                console.log(`Denormalized predictions for ${product}:`, denormalizedPredictions);
+                const inputSequence = last6Months.map((date, idx) => [date, lastQuantities[idx]]);
+                let currentInput = [...inputSequence];
+                const productPredictions = [];
 
-                const futureDateStrings = generateFutureDates(
-                    new Date(Math.max(...data.map(d => d.sales_date + '-01'))),
+                for (let i = 0; i < 6; i++) {
+                    const inputTensor = tf.tensor3d([currentInput], [1, 6, 2]);
+                    const prediction = model.predict(inputTensor);
+                    const predictedValue = prediction.dataSync()[0];
+
+                    const denormalizedPrediction = denormalizeQuantity(
+                        predictedValue,
+                        processedData.minQuantity,
+                        processedData.maxQuantity
+                    );
+
+                    productPredictions.push(denormalizedPrediction);
+
+                    const nextDate = last6Months[last6Months.length - 1] + i + 1;
+                    currentInput.shift();
+                    currentInput.push([nextDate, denormalizedPrediction]);
+
+                    inputTensor.dispose();
+                    prediction.dispose();
+                }
+
+                const futureDates = generateFutureDates(
+                    new Date(processedData.startDate),
                     6
                 );
 
-                predictions.push({
+                return {
                     product,
-                    predictions: futureDateStrings.map((date, i) => ({
+                    predictions: futureDates.map((date, i) => ({
                         date,
-                        quantity: denormalizedPredictions[i]
-                    }))
-                });
+                        quantity: productPredictions[i],
+                    })),
+                };
+            });
 
-                // Clean up tensors
-                inputTensor.dispose();
-                prediction.dispose();
-            }
-
-            console.log('Final predictions:', predictions);
             setPredictions(predictions);
         } catch (err) {
             setError('Error training model: ' + err.message);
@@ -121,101 +105,63 @@ const SalesPrediction = ({ data }) => {
         }
     };
 
+    const getPredictionsForProduct = (product) => {
+        if (!product || !predictions) return null;
+        return predictions.find((p) => p.product === product);
+    };
+
     const renderChart = (productData) => {
-        console.log('Rendering chart for product:', productData);
-        
         const chartData = [
             ...data
-                .filter(d => d.product_description === productData.product)
-                .map(d => ({
+                .filter((d) => d.product_description === productData.product)
+                .map((d) => ({
                     date: d.sales_date,
                     actual: parseInt(d.quantity_sold),
-                    predicted: null
+                    predicted: null,
                 })),
-            ...productData.predictions.map(p => ({
+            ...productData.predictions.map((p) => ({
                 date: p.date,
                 actual: null,
-                predicted: p.quantity
-            }))
+                predicted: p.quantity,
+            })),
         ];
 
-        console.log('Chart data:', chartData);
-
         return (
-            <Box key={productData.product} sx={{ mt: 4, p: 2, border: '1px solid #e0e0e0', borderRadius: 2 }}>
-                <Typography variant="h6" gutterBottom>
-                    {productData.product} - Sales Forecast
-                </Typography>
-                <Box sx={{ mb: 2 }}>
-                    <Typography variant="body2" color="textSecondary">
-                        Latest actual sale: {
-                            chartData.filter(d => d.actual !== null)
-                                .sort((a, b) => b.date.localeCompare(a.date))[0]?.actual || 'N/A'
-                        } units
-                    </Typography>
-                    <Typography variant="body2" color="textSecondary">
-                        Latest prediction: {
-                            chartData.filter(d => d.predicted !== null)
-                                .sort((a, b) => b.date.localeCompare(a.date))[0]?.predicted || 'N/A'
-                        } units
-                    </Typography>
-                </Box>
+            <Box key={productData.product} sx={{ mt: 4 }}>
+                <Typography variant="h6">{productData.product} - Sales Forecast</Typography>
                 <LineChart width={800} height={400} data={chartData}>
                     <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis 
-                        dataKey="date"
-                        tick={{ angle: -45 }}
-                        height={70}
-                        interval={0}
-                    />
+                    <XAxis dataKey="date" tick={{ angle: -45 }} height={70} interval={0} />
                     <YAxis />
-                    <Tooltip content={({ active, payload, label }) => {
-                        if (active && payload && payload.length) {
-                            return (
-                                <Box sx={{ bgcolor: 'white', p: 1, border: '1px solid #ccc' }}>
-                                    <Typography variant="body2">{label}</Typography>
-                                    {payload.map((entry) => (
-                                        <Typography 
-                                            key={entry.name}
-                                            variant="body2"
-                                            sx={{ color: entry.color }}
-                                        >
-                                            {entry.name}: {entry.value} units
-                                        </Typography>
-                                    ))}
-                                </Box>
-                            );
-                        }
-                        return null;
-                    }}/>
+                    <Tooltip />
                     <Legend />
-                    <Line 
-                        type="monotone" 
-                        dataKey="actual" 
-                        stroke="#8884d8" 
-                        name="Actual Sales" 
+                    <Line
+                        type="monotone"
+                        dataKey="actual"
+                        stroke="#8884d8"
+                        name="Actual Sales"
                         strokeWidth={2}
-                        dot={{ r: 4 }}
                     />
-                    <Line 
-                        type="monotone" 
-                        dataKey="predicted" 
-                        stroke="#82ca9d" 
+                    <Line
+                        type="monotone"
+                        dataKey="predicted"
+                        stroke="#82ca9d"
                         name="Predicted Sales"
-                        strokeWidth={2}
                         strokeDasharray="5 5"
-                        dot={{ r: 4 }}
+                        strokeWidth={2}
                     />
                 </LineChart>
             </Box>
         );
     };
 
+    const uniqueProducts = predictions ? predictions.map((p) => p.product) : [];
+
     return (
         <Box sx={{ my: 4 }}>
-            <Button 
-                variant="contained" 
-                onClick={trainModel} 
+            <Button
+                variant="contained"
+                onClick={trainModel}
                 disabled={isTraining || !data.length}
             >
                 {isTraining ? 'Training Model...' : 'Train Model'}
@@ -223,42 +169,32 @@ const SalesPrediction = ({ data }) => {
 
             {isTraining && (
                 <Box sx={{ mt: 2 }}>
-                    <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                        <CircularProgress size={24} sx={{ mr: 1 }} />
-                        <Typography>Training model...</Typography>
-                    </Box>
-                    <Box sx={{ width: '100%', maxWidth: 400 }}>
-                        <Typography variant="body2" color="textSecondary">
-                            Epoch: {trainingProgress.epoch}/{trainingProgress.totalEpochs} 
-                            {trainingProgress.loss > 0 && ` | Loss: ${trainingProgress.loss}`}
-                        </Typography>
-                        <Box sx={{ width: '100%', bgcolor: 'grey.200', height: 10, borderRadius: 1, mt: 1 }}>
-                            <Box
-                                sx={{
-                                    width: `${(trainingProgress.epoch / trainingProgress.totalEpochs) * 100}%`,
-                                    height: '100%',
-                                    bgcolor: 'primary.main',
-                                    borderRadius: 1,
-                                    transition: 'width 0.3s'
-                                }}
-                            />
-                        </Box>
-                    </Box>
+                    <CircularProgress />
+                    <Typography>Training model... Epoch {trainingProgress.epoch}/{trainingProgress.totalEpochs}</Typography>
+                    <Typography>Loss: {trainingProgress.loss}</Typography>
                 </Box>
             )}
 
-            {error && (
-                <Typography color="error" sx={{ mt: 2 }}>
-                    {error}
-                </Typography>
-            )}
+            {error && <Typography color="error">{error}</Typography>}
 
-            {predictions && predictions.length > 0 && (
+            <FormControl fullWidth sx={{ mt: 4 }}>
+                <InputLabel>Select Product</InputLabel>
+                <Select
+                    value={selectedProduct}
+                    onChange={(e) => setSelectedProduct(e.target.value)}
+                    label="Select Product"
+                >
+                    {uniqueProducts.map((product, index) => (
+                        <MenuItem key={index} value={product}>
+                            {product}
+                        </MenuItem>
+                    ))}
+                </Select>
+            </FormControl>
+
+            {selectedProduct && predictions && (
                 <Box sx={{ mt: 4 }}>
-                    <Typography variant="h5" sx={{ mb: 2 }}>
-                        Sales Predictions for Next 6 Months
-                    </Typography>
-                    {predictions.map(renderChart)}
+                    {renderChart(getPredictionsForProduct(selectedProduct))}
                 </Box>
             )}
         </Box>
